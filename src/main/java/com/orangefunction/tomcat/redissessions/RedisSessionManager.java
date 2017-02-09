@@ -90,9 +90,10 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
    */
   protected LifecycleSupport lifecycle = new LifecycleSupport(this);
 
+  protected boolean ssl = false;
+
   protected boolean encryption = false;
   private SecretKeySpec keySpec = null;
-
   public static final String CIPHER_ALGORITHM = "AES";
   public static final String CIPHER_MODE = "CBC";
   public static final String CIPHER_PADDING = "PKCS5Padding";
@@ -150,13 +151,21 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
     this.password = password;
   }
 
-	public boolean getEncryption() {
-		return encryption;
-	}
+  public boolean getEncryption() {
+    return encryption;
+  }
 
-	public void setEncryption(boolean encryption) {
-		this.encryption = encryption;
-	}
+  public void setEncryption(boolean encryption) {
+    this.encryption = encryption;
+  }
+
+  public boolean getSsl() {
+    return ssl;
+  }
+
+  public void setSsl(boolean ssl) {
+    this.ssl = ssl;
+  }
 
   public void setSerializationStrategyClass(String strategy) {
     this.serializationStrategyClass = strategy;
@@ -791,7 +800,7 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
           throw new LifecycleException("Error configuring Redis Sentinel connection pool: expected both `sentinelMaster` and `sentiels` to be configured");
         }
       } else {
-        connectionPool = new JedisPool(this.connectionPoolConfig, getHost(), getPort(), getTimeout(), getPassword());
+        connectionPool = new JedisPool(this.connectionPoolConfig, getHost(), getPort(), getTimeout(), getPassword(), ssl);
         log.info("Created standard JedisPool");
       }
     } catch (Exception e) {
@@ -843,7 +852,7 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
         String ksPassword = properties.getProperty("keystore.password");
         KeyStore keyStore = loadKeyStore(jksLocation, "JCEKS", ksPassword);
         keySpec = (SecretKeySpec) keyStore.getKey("thunderhead256", ksPassword.toCharArray());
-        log.error("Enabling session encryption");
+        log.info("Enabling session encryption");
 
       } catch (Exception e) {
         log.error("Failed to load keystore details. Disabling encryption. Error: " + e);
