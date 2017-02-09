@@ -1,36 +1,43 @@
 package com.orangefunction.tomcat.redissessions;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.URL;
+import java.security.KeyStore;
+import java.util.Arrays;
+import java.util.EnumSet;
+import java.util.Enumeration;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.Properties;
+import java.util.Set;
+
+import javax.crypto.Cipher;
+import javax.crypto.CipherInputStream;
+import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+
 import org.apache.catalina.Lifecycle;
 import org.apache.catalina.LifecycleException;
 import org.apache.catalina.LifecycleListener;
-import org.apache.catalina.util.LifecycleSupport;
 import org.apache.catalina.LifecycleState;
 import org.apache.catalina.Loader;
-import org.apache.catalina.Valve;
 import org.apache.catalina.Session;
+import org.apache.catalina.Valve;
 import org.apache.catalina.session.ManagerBase;
-
-import org.apache.commons.pool2.impl.GenericObjectPoolConfig;
-import org.apache.commons.pool2.impl.BaseObjectPoolConfig;
-
-import redis.clients.util.Pool;
-import redis.clients.jedis.JedisPool;
-import redis.clients.jedis.JedisSentinelPool;
-import redis.clients.jedis.JedisPoolConfig;
-import redis.clients.jedis.Jedis;
-import redis.clients.jedis.Protocol;
-
-import java.io.IOException;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.Enumeration;
-import java.util.Set;
-import java.util.EnumSet;
-import java.util.HashSet;
-import java.util.Iterator;
-
+import org.apache.catalina.util.LifecycleSupport;
 import org.apache.juli.logging.Log;
 import org.apache.juli.logging.LogFactory;
+
+import redis.clients.jedis.Jedis;
+import redis.clients.jedis.JedisPool;
+import redis.clients.jedis.JedisPoolConfig;
+import redis.clients.jedis.JedisSentinelPool;
+import redis.clients.jedis.Protocol;
+import redis.clients.util.Pool;
 
 
 public class RedisSessionManager extends ManagerBase implements Lifecycle {
@@ -83,6 +90,26 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
    */
   protected LifecycleSupport lifecycle = new LifecycleSupport(this);
 
+  protected boolean encryption = false;
+  private SecretKeySpec keySpec = null;
+
+  public static final String CIPHER_ALGORITHM = "AES";
+  public static final String CIPHER_MODE = "CBC";
+  public static final String CIPHER_PADDING = "PKCS5Padding";
+
+  private static final String TRANSFORMATION = CIPHER_ALGORITHM + "/" + CIPHER_MODE + "/" + CIPHER_PADDING;
+  private static final int BLOCK_SIZE = 1024;
+  /**
+   * **DO NOT CHANGE** - AES can use a 16-byte initialisation vector. Content is irrelevant.
+   */
+  private static final byte[] INITIALISATION_VECTOR = {
+          'I', 'N', 'I', 'T', 'V', 'E', 'C', 'T', 'I', 'N', 'I', 'T', 'V', 'E', 'C', 'T'
+  };
+
+  private static final IvParameterSpec IVSPEC = new IvParameterSpec(INITIALISATION_VECTOR);
+
+  Cipher cipher = null;
+
   public String getHost() {
     return host;
   }
@@ -122,6 +149,14 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
   public void setPassword(String password) {
     this.password = password;
   }
+
+	public boolean getEncryption() {
+		return encryption;
+	}
+
+	public void setEncryption(boolean encryption) {
+		this.encryption = encryption;
+	}
 
   public void setSerializationStrategyClass(String strategy) {
     this.serializationStrategyClass = strategy;
@@ -297,6 +332,8 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
       log.fatal("Unable to load serializer", e);
       throw new LifecycleException(e);
     }
+
+    initializeEncryption();
 
     log.info("Will expire sessions after " + getMaxInactiveInterval() + " seconds");
 
@@ -502,7 +539,7 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
       log.trace("Attempting to load session " + id + " from Redis");
 
       jedis = acquireConnection();
-      byte[] data = jedis.get(id.getBytes());
+      byte[] data = decrypt(jedis.get(id.getBytes()));
       error = false;
 
       if (data == null) {
@@ -614,7 +651,7 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
         SessionSerializationMetadata updatedSerializationMetadata = new SessionSerializationMetadata();
         updatedSerializationMetadata.setSessionAttributesHash(sessionAttributesHash);
 
-        jedis.set(binaryId, serializer.serializeFrom(redisSession, updatedSerializationMetadata));
+        jedis.set(binaryId, encrypt(serializer.serializeFrom(redisSession, updatedSerializationMetadata)));
 
         redisSession.resetDirtyTracking();
         currentSessionSerializationMetadata.set(updatedSerializationMetadata);
@@ -630,12 +667,65 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
 
       return error;
     } catch (IOException e) {
-      log.error(e.getMessage());
+      log.error(e.toString());
 
       throw e;
     } finally {
       return error;
     }
+  }
+
+  private byte[] encrypt(byte[] bytes) {
+    ByteArrayOutputStream cipherOStream = null;
+    byte[] sessionBytes = null;
+    if (keySpec != null) {
+      synchronized (cipher) {
+        cipherOStream = new ByteArrayOutputStream();
+        // encrypt the byte[]
+        try {
+          cipher.init(Cipher.ENCRYPT_MODE, keySpec, IVSPEC);
+          transform(cipher, new ByteArrayInputStream(bytes), cipherOStream);
+          cipherOStream.flush();
+          sessionBytes = cipherOStream.toByteArray();
+        } catch (Exception e) {
+        	log.error("Failed to encrypt data. Data will be stored un-encrypted. " + e);
+        }
+      }
+    }
+    return sessionBytes != null ? sessionBytes : bytes;
+  }
+
+  private byte[] decrypt(byte[] bytes) {
+    if (bytes == null || bytes.length <= 0) {
+      return bytes;
+    }
+
+    ByteArrayOutputStream cipherOStream = null;
+    byte[] sessionBytes = null;
+    if (keySpec != null) {
+      synchronized (cipher) {
+        cipherOStream = new ByteArrayOutputStream();
+        try {
+          cipher.init(Cipher.DECRYPT_MODE, keySpec, IVSPEC);
+          transform(cipher, new ByteArrayInputStream(bytes), cipherOStream);
+          cipherOStream.flush();
+          sessionBytes = cipherOStream.toByteArray();
+        } catch (Exception e) {
+        	log.error("Failed to decrypt data. Data will be returned un-decrypted. " + e);
+        }
+      }
+    }
+    return sessionBytes != null ? sessionBytes : bytes;
+  }
+
+  public void transform(Cipher cipher, InputStream src, OutputStream dest) throws IOException {
+    CipherInputStream cis = new CipherInputStream(src, cipher);
+    byte[] block = new byte[BLOCK_SIZE];
+    int len;
+    while ((len = cis.read(block, 0, BLOCK_SIZE)) > -1) {
+      dest.write(block, 0, len);
+    }
+    cis.close();
   }
 
   @Override
@@ -696,11 +786,13 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
         Set<String> sentinelSet = getSentinelSet();
         if (sentinelSet != null && sentinelSet.size() > 0) {
           connectionPool = new JedisSentinelPool(getSentinelMaster(), sentinelSet, this.connectionPoolConfig, getTimeout(), getPassword());
+          log.info("Created Sentinel JedisPool");
         } else {
           throw new LifecycleException("Error configuring Redis Sentinel connection pool: expected both `sentinelMaster` and `sentiels` to be configured");
         }
       } else {
         connectionPool = new JedisPool(this.connectionPoolConfig, getHost(), getPort(), getTimeout(), getPassword());
+        log.info("Created standard JedisPool");
       }
     } catch (Exception e) {
       e.printStackTrace();
@@ -724,6 +816,49 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
       classLoader = loader.getClassLoader();
     }
     serializer.setClassLoader(classLoader);
+  }
+
+  private void initializeEncryption() {
+    // initialize encryption if enabled
+    if (encryption && cipher == null) {
+      try {
+        cipher = Cipher.getInstance(TRANSFORMATION);
+      } catch (Exception e) {
+        log.error("Failed to initialize cipher. Disabling encryption. Error" + e);
+      }
+      try {
+        // read the keystore files
+        String propertiesLocation = System.getProperty("keystore.properties.file");
+        String jksLocation = System.getProperty("keystore.location.file");
+        if (propertiesLocation == null) {
+          log.error("System property keystore.properties.file missing. Disabling encryption");
+          return;
+        }
+        if (jksLocation == null) {
+          log.error("System property keystore.location.file missing. Disabling encryption");
+          return;
+        }
+        Properties properties = new Properties();
+        properties.load(new URL(propertiesLocation).openStream());
+        String ksPassword = properties.getProperty("keystore.password");
+        KeyStore keyStore = loadKeyStore(jksLocation, "JCEKS", ksPassword);
+        keySpec = (SecretKeySpec) keyStore.getKey("thunderhead256", ksPassword.toCharArray());
+        log.error("Enabling session encryption");
+
+      } catch (Exception e) {
+        log.error("Failed to load keystore details. Disabling encryption. Error: " + e);
+      }
+
+    }
+  }
+
+  public KeyStore loadKeyStore(String keyStoreLocation, String type, String keyStorePassword) throws
+          Exception {
+    try (java.io.InputStream is = new URL(keyStoreLocation).openStream()) {
+      KeyStore keyStore = KeyStore.getInstance(type);
+      keyStore.load(is, keyStorePassword.toCharArray());
+      return keyStore;
+    }
   }
 
 
